@@ -1,0 +1,107 @@
+{
+  "description": "Tiny real-video-trained state-action box dynamics predictor; not a robot policy",
+  "feature_names": [
+    "pusher_step_mm",
+    "relative_box_along_mm",
+    "relative_box_across_mm",
+    "previous_box_along_mm",
+    "previous_box_across_mm",
+    "first_step"
+  ],
+  "trained_trials": [
+    "P01_center",
+    "P02_offset"
+  ],
+  "heldout_trial": "P03_long",
+  "training_samples": 129,
+  "ridge_penalty": 10.0,
+  "calibration_note": "Approximate tape-based pixel-to-mm scale; P03 can reuse P02 with fixed camera",
+  "tracking_note": "Red-pusher centroid is a proxy for actual contact tip",
+  "validation_note": "Only three pilot videos; sequence autocorrelation; held-out trial, not proof of generalisation",
+  "baseline_alpha": 0.0779597847070503,
+  "trained_feature_mean": [
+    6.68522170638345,
+    22.215625153987858,
+    -81.63381529577201,
+    1.4881724524279198,
+    -0.6634641767345438,
+    0.031007751937984496
+  ],
+  "trained_feature_std": [
+    7.134401245225243,
+    60.325869902320484,
+    61.111346128212666,
+    1.2227578138512194,
+    1.8617672309871274,
+    0.17333860290696032
+  ],
+  "coefficient_matrix_intercept_first": [
+    [
+      1.5185423211139013,
+      -0.7262234952746963
+    ],
+    [
+      -0.09648394191219205,
+      -0.06246962436191287
+    ],
+    [
+      0.1341869710877458,
+      0.2121016402399742
+    ],
+    [
+      -0.0297242320978931,
+      0.1311269739544495
+    ],
+    [
+      0.9444520378724025,
+      -0.0762608479958406
+    ],
+    [
+      -0.06321557399879542,
+      1.3978512169977608
+    ],
+    [
+      -0.023303937821343587,
+      0.011037400704755477
+    ]
+  ],
+  "results": [
+    {
+      "holdout": "P03_long",
+      "start_frame": 180,
+      "end_frame": 247,
+      "valid_one_step_test_samples": 66,
+      "one_step": {
+        "learned": {
+          "mean_euclidean_mm": 0.7184721561090163,
+          "rmse_euclidean_mm": 1.248825798422484
+        },
+        "stationary": {
+          "mean_euclidean_mm": 3.4003676805941843,
+          "rmse_euclidean_mm": 3.763883938903257
+        },
+        "scaled_pusher_motion": {
+          "mean_euclidean_mm": 3.2100072228085677,
+          "rmse_euclidean_mm": 3.5698265982049606
+        },
+        "constant_box_velocity": {
+          "mean_euclidean_mm": 0.6282870665881115,
+          "rmse_euclidean_mm": 1.3089211446543767
+        }
+      },
+      "rollout": {
+        "frames": 68,
+        "imputed_single_pusher_frames": 1,
+        "rollout_path_mean_error_mm": 60.00591483895813,
+        "rollout_final_vector_error_mm": 125.55900204084432,
+        "rollout_final_magnitude_error_mm": 107.47074577508305,
+        "baseline_scaled_action_final_vector_error_mm": 211.20003525084135,
+        "real_box_displacement_mm": 223.75555862872676,
+        "predicted_box_displacement_mm": 116.28481285364371,
+        "scaled_action_baseline_displacement_mm": 12.620089222192743
+      },
+      "csv": "results\\world_model\\P03_long_180_247_heldout_rollout.csv",
+      "plot": "results\\world_model\\P03_long_180_247_rollout.png"
+    }
+  ]
+}
