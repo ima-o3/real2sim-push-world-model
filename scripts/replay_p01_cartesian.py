@@ -366,67 +366,24 @@ def extract_real_trajectory(csv_path):
 # MuJoCo helpers
 # =========================================================
 
-def find_ee(
-    model,
-):
+def find_ee(model):
+    name = "panda_pusher_contact"
 
-    site_candidates = [
-        "attachment_site",
-        "grasp_site",
-        "ee_site",
-    ]
-
-    for name in site_candidates:
-
-        idx = mujoco.mj_name2id(
-            model,
-            mujoco.mjtObj.mjOBJ_SITE,
-            name,
-        )
-
-        if idx >= 0:
-
-            print(
-                f"Using EE site: "
-                f"{name}"
-            )
-
-            return (
-                "site",
-                idx,
-                name,
-            )
-
-    body_candidates = [
-        "panda_hand",
-        "hand",
-    ]
-
-    for name in body_candidates:
-
-        idx = mujoco.mj_name2id(
-            model,
-            mujoco.mjtObj.mjOBJ_BODY,
-            name,
-        )
-
-        if idx >= 0:
-
-            print(
-                f"Using EE body: "
-                f"{name}"
-            )
-
-            return (
-                "body",
-                idx,
-                name,
-            )
-
-    raise RuntimeError(
-        "Could not find Panda "
-        "end effector."
+    idx = mujoco.mj_name2id(
+        model,
+        mujoco.mjtObj.mjOBJ_SITE,
+        name,
     )
+
+    if idx < 0:
+        raise RuntimeError(
+            f"Required pusher site '{name}' not found. "
+            "Check the Panda XML and attached model."
+        )
+
+    print(f"Using EE site: {name}")
+
+    return ("site", idx, name)
 
 
 def get_ee_pose(
@@ -922,6 +879,111 @@ box_body_id = find_box_body(
 
 
 # =========================================================
+# Find a collision-free starting pose for the pusher
+# =========================================================
+
+setup_data = mujoco.MjData(model)
+
+# Start from the old robot configuration as an IK seed.
+for adr, value in zip(qpos_addresses, Q_START):
+    setup_data.qpos[adr] = value
+
+mujoco.mj_forward(model, setup_data)
+
+old_tip, old_rotation = get_ee_pose(setup_data, ee)
+box_centre = setup_data.xpos[box_body_id].copy()
+
+print("\nSAFE START CONFIGURATION")
+print("------------------------")
+print("Old pusher tip:", np.round(old_tip, 4))
+print("Box centre:", np.round(box_centre, 4))
+
+# The box is 80 mm wide in Y, so its incoming
+# face is at y = 0.040 m.
+#
+# Position the pusher 12 mm beyond that face,
+# giving approximately 6 mm of clearance
+# after accounting for the capsule radius.
+#
+# Position its contact tip at box mid-height.
+
+safe_target = np.array([
+    box_centre[0],
+    box_centre[1] + 0.052,
+    box_centre[2],
+])
+
+print("Target tip:", np.round(safe_target, 4))
+
+q_safe, pos_error, rot_error = solve_ik(
+    model=model,
+    data=setup_data,
+    ee=ee,
+    qpos_addresses=qpos_addresses,
+    dof_indices=dof_indices,
+    joint_ids=joint_ids,
+    q_seed=Q_START.copy(),
+    target_position=safe_target,
+    target_rotation=old_rotation,
+)
+
+print(f"Start IK error: {pos_error * 1000:.3f} mm")
+
+if pos_error > 0.002:
+    raise RuntimeError(
+        "Could not find an accurate collision-free start pose."
+    )
+
+# Install the new robot start configuration.
+Q_START = q_safe.copy()
+
+# Use a joint-1 sweep from the NEW start pose only
+# to establish the camera-to-robot push direction.
+Q_END_REFERENCE = Q_START.copy()
+Q_END_REFERENCE[0] -= 0.25
+
+# Verify that the initial geometry no longer
+# has substantial physical penetration.
+for adr, value in zip(qpos_addresses, Q_START):
+    setup_data.qpos[adr] = value
+
+mujoco.mj_forward(model, setup_data)
+
+actual_tip, _ = get_ee_pose(setup_data, ee)
+print("Solved tip:", np.round(actual_tip, 4))
+print(
+    "Tip height above table:",
+    round((actual_tip[2] - 0.375) * 1000, 2),
+    "mm",
+)
+
+for i in range(setup_data.ncon):
+    contact = setup_data.contact[i]
+
+    a = mujoco.mj_id2name(
+        model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom1
+    ) or ""
+
+    b = mujoco.mj_id2name(
+        model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom2
+    ) or ""
+
+    robot_environment_contact = (
+        (a.startswith("panda_") and b in ("table", "box_geom"))
+        or
+        (b.startswith("panda_") and a in ("table", "box_geom"))
+    )
+
+    if robot_environment_contact and contact.dist < -0.002:
+        raise RuntimeError(
+            f"Initial penetration: {a} vs {b}, "
+            f"{contact.dist * 1000:.2f} mm"
+        )
+
+print("Safe starting configuration prepared.")
+
+
+# =========================================================
 # Establish start pose
 # =========================================================
 
@@ -1273,238 +1335,158 @@ mujoco.mj_forward(
 )
 
 
-with mujoco.viewer.launch_passive(
-    model,
-    data,
-) as viewer:
+# =========================================================
+# Hold-pose calibration and dynamic replay
+# =========================================================
+# MuJoCo's Panda position actuators can have a finite static
+# joint offset under gravity. Identify a SMALL feed-forward
+# setpoint correction using the stationary robot, rather than
+# permitting large tool drift or silently relaxing safeguards.
 
-    # -----------------------------------------------------
-    # Settle at starting pose
-    # -----------------------------------------------------
+with mujoco.viewer.launch_passive(model, data) as viewer:
+    hold_command = Q_START.copy()
+    MAX_HOLD_BIAS_RAD = 0.035     # 2.0 degrees per joint maximum
+    MAX_BIAS_STEP_RAD = 0.012    # 0.69 degrees per iteration
+    HOLD_ERROR_LIMIT_MM = 2.0    # Strict start-pose tolerance
+    MAX_SETTLING_ROUNDS = 8
+    SETTLING_SECONDS_PER_ROUND = 0.7
 
-    settle_duration = 1.5
+    def ensure_valid_arm_command(command):
+        for actuator_id, requested in zip(arm_actuator_ids, command):
+            if model.actuator_ctrllimited[actuator_id]:
+                lower, upper = model.actuator_ctrlrange[actuator_id]
+                if requested < lower or requested > upper:
+                    raise RuntimeError(
+                        f"Position actuator {actuator_id} setpoint "
+                        f"{requested:.4f} outside [{lower:.4f}, {upper:.4f}]"
+                    )
 
-    settle_steps = int(
-        settle_duration
-        / model.opt.timestep
-    )
+    def reject_unintended_contacts():
+        """Abort if table contact or premature box contact occurs."""
+        for i in range(data.ncon):
+            contact = data.contact[i]
+            a = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom1
+            ) or ""
+            b = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, contact.geom2
+            ) or ""
+            if a.startswith("panda_") and b in {"table", "box_geom"} or (
+                b.startswith("panda_") and a in {"table", "box_geom"}
+            ):
+                raise RuntimeError(
+                    "Unintended robot/environment contact while settling: "
+                    f"{a} vs {b}, distance {contact.dist * 1000:.2f} mm. "
+                    "Check pusher placement before replay."
+                )
 
-    for _ in range(
-        settle_steps
-    ):
+    print("\nGRAVITY / STATIC SETPOINT CALIBRATION")
+    print("-------------------------------------")
 
-        data.ctrl[
-            arm_actuator_ids
-        ] = Q_START
+    for round_id in range(1, MAX_SETTLING_ROUNDS + 1):
+        ensure_valid_arm_command(hold_command)
+        steps = int(
+            SETTLING_SECONDS_PER_ROUND / model.opt.timestep
+        )
+        for _ in range(steps):
+            data.ctrl[arm_actuator_ids] = hold_command
+            data.ctrl[gripper_actuator_id] = GRIPPER_TARGET
+            mujoco.mj_step(model, data)
+            reject_unintended_contacts()
+            viewer.sync()
+            time.sleep(model.opt.timestep)
 
-        data.ctrl[
-            gripper_actuator_id
-        ] = GRIPPER_TARGET
+        actual_ee_start, _ = get_ee_pose(data, ee)
+        q_actual = np.array([data.qpos[adr] for adr in qpos_addresses])
+        tip_error_mm = (actual_ee_start - ee_start_position) * 1000.0
+        start_drift_mm = float(np.linalg.norm(tip_error_mm))
+        joint_error = Q_START - q_actual
+        velocity_norm = float(np.linalg.norm(data.qvel[dof_indices]))
 
-        mujoco.mj_step(
-            model,
-            data,
+        print(
+            f"Round {round_id}: tip drift {start_drift_mm:.2f} mm; "
+            f"XYZ error {np.round(tip_error_mm, 2)} mm; "
+            f"joint velocity {velocity_norm:.4f} rad/s"
         )
 
-        viewer.sync()
+        if start_drift_mm <= HOLD_ERROR_LIMIT_MM and velocity_norm < 0.03:
+            print("Static starting pose validated.")
+            break
 
-        time.sleep(
-            model.opt.timestep
+        # A position servo under gravity sags, so command slightly
+        # beyond the desired joint position to compensate. This is
+        # a measured, bounded setpoint offset, not an IK modification.
+        hold_command += np.clip(
+            0.8 * joint_error,
+            -MAX_BIAS_STEP_RAD,
+            MAX_BIAS_STEP_RAD,
+        )
+        if np.max(np.abs(hold_command - Q_START)) > MAX_HOLD_BIAS_RAD:
+            raise RuntimeError(
+                "Static gravity compensation exceeded 2 degrees. "
+                "Check actuator gains, saturation and contact geometry."
+            )
+    else:
+        raise RuntimeError(
+            f"Start pose not stable after {MAX_SETTLING_ROUNDS} rounds: "
+            f"tip drift {start_drift_mm:.2f} mm. "
+            "No replay was executed."
         )
 
+    # Apply the same experimentally determined joint-space offset
+    # to every subsequent position-actuator command. Offline IK
+    # waypoints remain unchanged, and the actual trajectory error
+    # will still be measured and reported.
+    actuator_bias = hold_command - Q_START
+    print("Final start-pose drift:", round(start_drift_mm, 2), "mm")
+    print("Joint setpoint bias (deg):", np.round(np.degrees(actuator_bias), 3))
 
-    (
-        actual_ee_start,
-        _,
-    ) = get_ee_pose(
-        data,
-        ee,
-    )
-
-
-    box_start = (
-        data.xpos[
-            box_body_id
-        ].copy()
-    )
-
-
-    # -----------------------------------------------------
-    # Logging
-    # -----------------------------------------------------
-
+    box_start = data.xpos[box_body_id].copy()
     sim_times = []
-
     desired_log = []
-
     actual_log = []
-
     box_log = []
 
+    push_steps = int(np.ceil(real["duration"] / model.opt.timestep)) + 1
+    simulation_push_start_time = data.time
 
-    push_steps = int(
-        np.ceil(
-            real["duration"]
-            / model.opt.timestep
-        )
-    ) + 1
-
-
-    simulation_push_start_time = (
-        data.time
-    )
-
-
-    # -----------------------------------------------------
-    # Replay trajectory
-    # -----------------------------------------------------
-
-    for step in range(
-        push_steps
-    ):
-
-        elapsed = (
-            step
-            * model.opt.timestep
+    for step in range(push_steps):
+        elapsed = min(step * model.opt.timestep, real["duration"])
+        q_nominal = interpolate_waypoint(elapsed, real["time"], q_waypoints)
+        q_command = q_nominal + actuator_bias
+        ensure_valid_arm_command(q_command)
+        desired_position = interpolate_waypoint(
+            elapsed, real["time"], desired_positions
         )
 
-        elapsed = min(
-            elapsed,
-            real["duration"],
-        )
+        data.ctrl[arm_actuator_ids] = q_command
+        data.ctrl[gripper_actuator_id] = GRIPPER_TARGET
+        mujoco.mj_step(model, data)
+        actual_position, _ = get_ee_pose(data, ee)
 
-
-        q_command = (
-            interpolate_waypoint(
-                elapsed,
-                real["time"],
-                q_waypoints,
-            )
-        )
-
-
-        desired_position = (
-            interpolate_waypoint(
-                elapsed,
-                real["time"],
-                desired_positions,
-            )
-        )
-
-
-        data.ctrl[
-            arm_actuator_ids
-        ] = q_command
-
-
-        data.ctrl[
-            gripper_actuator_id
-        ] = GRIPPER_TARGET
-
-
-        mujoco.mj_step(
-            model,
-            data,
-        )
-
-
-        (
-            actual_position,
-            _,
-        ) = get_ee_pose(
-            data,
-            ee,
-        )
-
-
-        sim_times.append(
-            data.time
-            - simulation_push_start_time
-        )
-
-        desired_log.append(
-            desired_position.copy()
-        )
-
-        actual_log.append(
-            actual_position.copy()
-        )
-
-        box_log.append(
-            data.xpos[
-                box_body_id
-            ].copy()
-        )
-
+        sim_times.append(data.time - simulation_push_start_time)
+        desired_log.append(desired_position.copy())
+        actual_log.append(actual_position.copy())
+        box_log.append(data.xpos[box_body_id].copy())
 
         viewer.sync()
+        time.sleep(model.opt.timestep)
 
-        time.sleep(
-            model.opt.timestep
-        )
+    ee_push_end, _ = get_ee_pose(data, ee)
+    box_push_end = data.xpos[box_body_id].copy()
 
-
-    # -----------------------------------------------------
-    # State immediately after push
-    # -----------------------------------------------------
-
-    (
-        ee_push_end,
-        _,
-    ) = get_ee_pose(
-        data,
-        ee,
-    )
-
-
-    box_push_end = (
-        data.xpos[
-            box_body_id
-        ].copy()
-    )
-
-
-    # -----------------------------------------------------
-    # Let object settle
-    # -----------------------------------------------------
-
-    hold_steps = int(
-        2.0
-        / model.opt.timestep
-    )
-
-
-    for _ in range(
-        hold_steps
-    ):
-
-        data.ctrl[
-            arm_actuator_ids
-        ] = (
-            q_waypoints[-1]
-        )
-
-        data.ctrl[
-            gripper_actuator_id
-        ] = GRIPPER_TARGET
-
-        mujoco.mj_step(
-            model,
-            data,
-        )
-
+    # Hold final joint targets after the push; cube may keep sliding.
+    end_command = q_waypoints[-1] + actuator_bias
+    ensure_valid_arm_command(end_command)
+    hold_steps = int(2.0 / model.opt.timestep)
+    for _ in range(hold_steps):
+        data.ctrl[arm_actuator_ids] = end_command
+        data.ctrl[gripper_actuator_id] = GRIPPER_TARGET
+        mujoco.mj_step(model, data)
         viewer.sync()
+        time.sleep(model.opt.timestep)
 
-        time.sleep(
-            model.opt.timestep
-        )
-
-
-    box_final = (
-        data.xpos[
-            box_body_id
-        ].copy()
-    )
+    box_final = data.xpos[box_body_id].copy()
 
 
 # =========================================================
