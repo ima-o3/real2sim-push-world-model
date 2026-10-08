@@ -1,0 +1,23 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded dependencies
+external/
+
+# Raw experimental footage
+data/raw/
+*.mp4
+*.mov
+*.avi
+
+# Large generated videos
+results/videos/
+
+# Local development files
+.vscode/
+.ipynb_checkpoints/
+.env
+.env.*
+!.env.example

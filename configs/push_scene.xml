@@ -1,0 +1,65 @@
+<mujoco model="real2sim push scene">
+
+    <option timestep="0.002" integrator="implicitfast"/>
+
+    <asset>
+        <model
+            name="panda"
+            file="../external/mujoco_menagerie/franka_emika_panda/panda.xml"/>
+    </asset>
+
+    <visual>
+        <headlight
+            diffuse="0.6 0.6 0.6"
+            ambient="0.3 0.3 0.3"
+            specular="0 0 0"/>
+    </visual>
+
+    <worldbody>
+
+        <light
+            pos="0 0 2"
+            dir="0 0 -1"
+            directional="true"/>
+
+        <!-- Ground -->
+        <geom
+            name="floor"
+            type="plane"
+            size="2 2 0.05"
+            rgba="0.25 0.3 0.35 1"/>
+
+        <!-- Franka Panda -->
+        <attach
+            model="panda"
+            prefix="panda_"/>
+
+        <!-- Table -->
+        <geom
+            name="table"
+            type="box"
+            pos="0.55 0 0.35"
+            size="0.35 0.35 0.025"
+            friction="1 0.1 0.1"
+            rgba="0.65 0.45 0.25 1"/>
+
+        <!-- Pushable object -->
+        <body
+            name="box"
+            pos="0.55 0 0.41">
+
+            <freejoint/>
+
+            <geom
+                name="box_geom"
+                type="box"
+                size="0.04 0.04 0.035"
+                mass="0.2"
+                friction="0.8 0.1 0.1"
+                rgba="0.15 0.45 0.9 1"/>
+
+        </body>
+
+    </worldbody>
+
+</mujoco>
